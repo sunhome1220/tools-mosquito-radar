@@ -140,7 +140,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
     <summary>使用技巧與限制</summary>
     <ul>
       <li>蚊子只有幾毫米，鏡頭離牆約 1 到 2 公尺內最容易抓到。越遠越難。</li>
-      <li>對著乾淨的白牆、淺色天花板效果最好；花紋、窗簾、電視畫面會造成誤報。</li>
+      <li>對著乾淨的白牆、淺色天花板效果最好。背景有花紋或雜物時，只有小點本身持續往一個方向移動才算蚊子，所以反應會慢一點點。</li>
       <li>手機要放穩不能動。偵測到鏡頭移動（手機動作感測器或整個畫面位移）時會暫停偵測，停穩約 1.5 秒後自動恢復。</li>
       <li>光線要夠，暗處鏡頭雜訊多，小點很難和雜訊分開。開一盞燈照著牆面最好。</li>
       <li>小蟲、灰塵、光影閃動也可能觸發警報，這是畫面差分偵測的先天限制，請用靈敏度和確認幀數調整。</li>
@@ -155,7 +155,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
 <button class="update" id="updateBtn" hidden>有新版本，點此重新整理</button>
 
 <script>
-const VERSION = "v1.6.0";
+const VERSION = "v1.7.0";
 document.getElementById("ver").textContent = "蚊子雷達 " + VERSION;
 
 // ---- new-version check: compares VERSION with version.json on the server ----
@@ -600,17 +600,30 @@ function findBlobs(){
         const i = y*W+x;
         if (mask[i] && label[i] !== b.lab){ other++; labs.add(label[i]); }
       }
-    if (labs.size >= 2 || other > b.area*2 + 4) return false;
-    // and the background around it should be fairly plain
+    // busy spot (other specks nearby, or patterned background): keep it, but its track must prove itself by moving
+    b.busy = labs.size >= 2 || other > b.area*2 + 4;
+    if (b.busy) return true;
     let sum = 0, sq = 0, n = 0;
     for (let y = Math.max(0, (b.y-R)|0); y <= Math.min(H-1, (b.y+R)|0); y += 2)
       for (let x = Math.max(0, (b.x-R)|0); x <= Math.min(W-1, (b.x+R)|0); x += 2){ const v = bg[y*W+x]; sum += v; sq += v*v; n++; }
     const sd = Math.sqrt(Math.max(0, sq/n - (sum/n)**2));
-    return sd < 28;
+    b.busy = sd >= 28;
+    return true;
   });
-  return keep.length > 12 ? null : keep;   // still many specks after removing people = flicker or noise
+  // very many specks at once (flicker, heavy noise): only plain-background ones are worth following
+  return keep.length > 30 ? keep.filter(b => !b.busy) : keep;
 }
 
+// A track counts as a mosquito when the spot itself keeps moving away from where it started.
+// On a plain wall a short move is enough; on a busy/patterned background (flickering edges jitter in place)
+// it needs more frames, a longer net move and a fairly straight path.
+function isMosquito(tr){
+  const net = Math.hypot(tr.x - tr.sx, tr.y - tr.sy);
+  if (tr.busy > tr.hits * 0.3){
+    return tr.hits >= S.persist + 2 && net >= W / 30 && net >= tr.travel * 0.45;
+  }
+  return tr.hits >= S.persist && net >= Math.max(4, W / 120);
+}
 function updateTracks(blobs){
   const maxDist = W * 0.12;
   const used = new Set();
@@ -620,13 +633,13 @@ function updateTracks(blobs){
     if (best >= 0){
       const b = blobs[best]; used.add(best);
       tr.x = b.x; tr.y = b.y; tr.r = b.r; tr.hits++; tr.miss = 0; tr.path.push([b.x,b.y]); if (tr.path.length > 30) tr.path.shift();
-      tr.travel += bd;
+      tr.travel += bd; if (b.busy) tr.busy++;
     } else tr.miss++;
   }
   tracks = tracks.filter(tr => tr.miss <= 3);
-  blobs.forEach((b, k) => { if (!used.has(k) && tracks.length < 40) tracks.push({ id: nextId++, x:b.x, y:b.y, r:b.r, hits:1, miss:0, travel:0, path:[[b.x,b.y]], confirmed:false, seen:performance.now() }); });
+  blobs.forEach((b, k) => { if (!used.has(k) && tracks.length < 40) tracks.push({ id: nextId++, x:b.x, y:b.y, r:b.r, sx:b.x, sy:b.y, hits:1, miss:0, travel:0, busy: b.busy ? 1 : 0, path:[[b.x,b.y]], confirmed:false, seen:performance.now() }); });
   for (const tr of tracks){
-    if (!tr.confirmed && tr.hits >= S.persist && tr.travel > 4){ tr.confirmed = true; alarm(tr); }
+    if (!tr.confirmed && isMosquito(tr)){ tr.confirmed = true; alarm(tr); }
     if (tr.confirmed) lastSpot = { x: tr.x, y: tr.y, t: performance.now() };
   }
 }
