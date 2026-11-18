@@ -47,12 +47,17 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 .ctl small{color:var(--muted);font-size:12px}
 input[type=range]{width:100%;accent-color:var(--accent)}
 select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px}
-.check{flex-direction:row;align-items:center;gap:10px}
+.check{flex-direction:row;flex-wrap:wrap;align-items:center;gap:10px}
 details{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
 summary{cursor:pointer;font-weight:600}
 details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
 #log{font:12px/1.6 var(--mono);color:var(--muted);max-height:140px;overflow:auto;margin:6px 0 0;padding:0;list-style:none}
-@media (prefers-reduced-motion:reduce){.stage.alarm{animation:none}}
+.flashAll{position:fixed;inset:0;z-index:30;pointer-events:none;background:var(--alarm);opacity:0}
+.flashAll.on{animation:flashAll .9s ease-out}
+@keyframes flashAll{0%,30%,60%{opacity:.55}15%,45%,100%{opacity:0}}
+.moving{position:absolute;top:8px;left:50%;transform:translateX(-50%);background:rgba(240,180,76,.92);color:#1d1404;font-weight:700;font-size:14px;padding:4px 12px;border-radius:999px;white-space:nowrap}
+#vibNote{color:var(--warn)}
+@media (prefers-reduced-motion:reduce){.stage.alarm{animation:none}.flashAll.on{animation:none}}
 </style>
 </head>
 <body>
@@ -66,6 +71,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
     <canvas id="view"></canvas>
     <canvas id="overlay"></canvas>
     <span class="privacy" id="privacy" hidden></span>
+    <span class="moving" id="moving" hidden>鏡頭移動中，靜置後才會偵測</span>
     <div class="placeholder" id="ph">把手機或電腦固定好，鏡頭對著白牆或淺色天花板，再按「開始偵測」。</div>
   </div>
 
@@ -114,6 +120,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
       <input type="checkbox" id="sound" checked><label for="sound">聲音</label>
       <input type="checkbox" id="vibrate" checked><label for="vibrate">震動</label>
       <input type="checkbox" id="debug"><label for="debug">顯示變動像素</label>
+      <small id="vibNote" hidden>這個瀏覽器不支援震動（iPhone 的瀏覽器都不支援），會改用全螢幕紅光閃爍提醒。</small>
     </div>
   </div>
 
@@ -127,7 +134,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
     <ul>
       <li>蚊子只有幾毫米，鏡頭離牆約 1 到 2 公尺內最容易抓到。越遠越難。</li>
       <li>對著乾淨的白牆、淺色天花板效果最好；花紋、窗簾、電視畫面會造成誤報。</li>
-      <li>手機要放穩不能動。偵測到整個畫面在晃動時會暫停判斷（黃燈）。</li>
+      <li>手機要放穩不能動。偵測到鏡頭移動（手機動作感測器或整個畫面位移）時會暫停偵測，停穩約 1.5 秒後自動恢復。</li>
       <li>光線要夠，暗處鏡頭雜訊多，小點很難和雜訊分開。開一盞燈照著牆面最好。</li>
       <li>小蟲、灰塵、光影閃動也可能觸發警報，這是畫面差分偵測的先天限制，請用靈敏度和確認幀數調整。</li>
       <li>偵測期間請保持本頁開著、螢幕亮著；切到其他 App 或鎖屏後瀏覽器會暫停鏡頭。</li>
@@ -137,10 +144,11 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
   </details>
   <footer><span id="ver"></span></footer>
 </div>
+<div class="flashAll" id="flashAll"></div>
 <button class="update" id="updateBtn" hidden>有新版本，點此重新整理</button>
 
 <script>
-const VERSION = "v1.3.0";
+const VERSION = "v1.4.0";
 document.getElementById("ver").textContent = "蚊子雷達 " + VERSION;
 
 // ---- new-version check: compares VERSION with version.json on the server ----
@@ -191,6 +199,7 @@ $("vibrate").addEventListener("change", save);
 
 // ---- state ----
 let stream = null, facing = "environment", running = false;
+let CW = 0, CH = 0, coarse = null, prevCoarse = null;
 let W = 0, H = 0, bg = null, gray = null, mask = null, label = null;
 let tracks = [], nextId = 1, lastAlarm = -1e9, alarmCount = 0, lastSpot = null, warm = 0, wakeLock = null;
 
@@ -224,14 +233,40 @@ function alarm(track){
   setStatus("alarm", "發現疑似蚊子！看紅圈位置");
   const st = $("stage"); st.classList.remove("alarm"); void st.offsetWidth; st.classList.add("alarm");
   beep();
-  if ($("vibrate").checked && navigator.vibrate) navigator.vibrate([200,100,200]);
+  buzz();
+  const fa = $("flashAll"); fa.classList.remove("on"); void fa.offsetWidth; fa.classList.add("on");
   const li = document.createElement("li");
   const x = Math.round(track.x / W * 100), y = Math.round(track.y / H * 100);
   li.textContent = new Date().toLocaleTimeString() + "　位置 左" + x + "% 上" + y + "%";
   $("log").prepend(li);
   if (navigator.serviceWorker === undefined && document.hidden && "Notification" in window && Notification.permission === "granted") new Notification("蚊子雷達：發現疑似蚊子");
 }
-$("testBtn").onclick = () => { beep(); if ($("vibrate").checked && navigator.vibrate) navigator.vibrate([200,100,200]); };
+const canVibrate = typeof navigator.vibrate === "function";
+if (!canVibrate) $("vibNote").hidden = false;
+function buzz(){
+  if (!$("vibrate").checked || !canVibrate) return;
+  try{ navigator.vibrate([400,120,400,120,600]); }catch(e){}
+}
+$("testBtn").onclick = () => { beep(); buzz(); const fa = $("flashAll"); fa.classList.remove("on"); void fa.offsetWidth; fa.classList.add("on"); };
+
+// ---- camera movement: motion sensor ----
+let movingUntil = 0;
+const SETTLE_MS = 1500;
+function markMoving(){ movingUntil = performance.now() + SETTLE_MS; }
+function onMotion(e){
+  const r = e.rotationRate, a = e.acceleration;
+  const rot = r ? Math.hypot(r.alpha || 0, r.beta || 0, r.gamma || 0) : 0;   // degrees per second
+  const acc = a ? Math.hypot(a.x || 0, a.y || 0, a.z || 0) : 0;              // m/s^2 without gravity
+  if (rot > 4 || acc > 0.35) markMoving();
+}
+async function enableMotion(){
+  try{
+    if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function"){
+      if (await DeviceMotionEvent.requestPermission() !== "granted") return;   // iPhone asks once
+    }
+    window.addEventListener("devicemotion", onMotion);
+  }catch(e){}
+}
 
 // ---- camera ----
 async function startCamera(){
@@ -255,6 +290,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && ru
 $("startBtn").onclick = async () => {
   if (running){ running = false; stopCamera(); $("startBtn").textContent = "開始偵測"; setStatus("idle","已停止"); $("ph").hidden = false; $("privacy").hidden = true; vctx.clearRect(0,0,view.width,view.height); try{wakeLock?.release()}catch(e){} return; }
   try{ actx = actx || new (window.AudioContext || window.webkitAudioContext)(); actx.resume(); }catch(e){}
+  enableMotion();
   if (await startCamera()){ running = true; $("startBtn").textContent = "停止偵測"; setStatus("watch","暖機中，請保持鏡頭不動…"); keepAwake(); requestAnimationFrame(loop); }
   updatePrivacy();
 };
@@ -344,6 +380,7 @@ function setup(){
   $("stage").style.aspectRatio = vw + "/" + vh;
   const n = W * H;
   bg = new Float32Array(n); gray = new Float32Array(n); mask = new Uint8Array(n); label = new Int32Array(n);
+  CW = W >> 2; CH = H >> 2; coarse = new Float32Array(CW*CH); prevCoarse = null;
   warm = 0;
 }
 
@@ -373,17 +410,45 @@ function loop(t){
     mask[i] = m; changed += m;
   }
   const frac = changed / n;
-  const shaking = frac > 0.03;
-  // update background: fast while warming or shaking, slow otherwise
-  const a = warm < 15 ? 0.3 : shaking ? 0.25 : 0.06;
+  if (globalShift()) markMoving();
+  if (frac > 0.02) markMoving();                       // big part of the picture changed
+  const now = performance.now();
+  const moving = now < movingUntil;
+  // update background: fast while warming or moving, slow otherwise
+  const a = warm < 15 ? 0.3 : moving ? 0.35 : 0.06;
   for (let i = 0; i < n; i++) bg[i] += (gray[i] - bg[i]) * a;
 
-  const blobs = (shaking || warm < 15) ? [] : findBlobs();
-  if (shaking){ tracks = []; if ($("status").dataset.s !== "alarm" || performance.now() - lastAlarm > 2000) setStatus("shake","畫面晃動或光線變化中，暫停判斷"); }
-  else if (warm >= 15 && performance.now() - lastAlarm > 2500) setStatus("watch","監視中");
+  let blobs = (moving || warm < 15) ? [] : findBlobs();
+  if (blobs === null){ markMoving(); blobs = []; }      // lots of specks at once = picture shifting
+  $("moving").hidden = !(moving && warm >= 15);
+  if (moving){ tracks = []; if (now - lastAlarm > 2000) setStatus("shake","鏡頭移動中已停止偵測，請把手機靜置"); }
+  else if (warm >= 15 && now - lastAlarm > 2500) setStatus("watch","監視中");
 
   updateTracks(blobs);
   draw(blobs);
+}
+
+// Is the whole picture shifting? Compare a 1/4-size frame with the previous one at small offsets.
+function globalShift(){
+  for (let y = 0; y < CH; y++) for (let x = 0; x < CW; x++){
+    let s = 0; const b = (y*4)*W + x*4;
+    for (let k = 0; k < 4; k++){ const r = b + k*W; s += gray[r] + gray[r+1] + gray[r+2] + gray[r+3]; }
+    coarse[y*CW + x] = s / 16;
+  }
+  if (!prevCoarse){ prevCoarse = new Float32Array(coarse); return false; }
+  const R = 3, m = R + 1;
+  let best = Infinity, zero = 0, bx = 0, by = 0;
+  for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++){
+    let sad = 0;
+    for (let y = m; y < CH - m; y += 1) for (let x = m; x < CW - m; x += 1)
+      sad += Math.abs(coarse[y*CW + x] - prevCoarse[(y+dy)*CW + x + dx]);
+    if (dx === 0 && dy === 0) zero = sad;
+    if (sad < best){ best = sad; bx = dx; by = dy; }
+  }
+  prevCoarse.set(coarse);
+  const area = (CW - 2*m) * (CH - 2*m);
+  // shifted match clearly better than "no movement", and the frame actually changed
+  return (bx || by) && best < zero * 0.75 && zero / area > 1.2;
 }
 
 function findBlobs(){
@@ -413,7 +478,7 @@ function findBlobs(){
         blobs.push({ x: sx/area, y: sy/area, area, r: span/2 + 2 });
     }
   }
-  return blobs.length > 25 ? [] : blobs; // too many specks = noise / lighting
+  return blobs.length > 12 ? null : blobs; // too many specks at once = camera moving or light flicker
 }
 
 function updateTracks(blobs){
