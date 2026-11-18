@@ -126,7 +126,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
     <div class="ctl check">
       <input type="checkbox" id="sound" checked><label for="sound">聲音</label>
       <input type="checkbox" id="vibrate" checked><label for="vibrate">震動</label>
-      <input type="checkbox" id="debug"><label for="debug">顯示變動像素</label>
+      <input type="checkbox" id="debug"><label for="debug">顯示變動像素與排除區</label>
       <small id="vibNote" hidden>這個瀏覽器不支援震動（iPhone 的瀏覽器都不支援），會改用全螢幕紅光閃爍提醒。</small>
     </div>
   </div>
@@ -146,7 +146,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
       <li>小蟲、灰塵、光影閃動也可能觸發警報，這是畫面差分偵測的先天限制，請用靈敏度和確認幀數調整。</li>
       <li>偵測期間請保持本頁開著、螢幕亮著；切到其他 App 或鎖屏後瀏覽器會暫停鏡頭。</li>
       <li>畫面只在你的裝置上即時分析，不錄影、不存檔、不上傳。</li>
-      <li>畫面中的人臉會自動蓋上卡通笑臉。人臉偵測還沒載入完成或載入失敗時，會整個畫面不顯示，只顯示蚊子的紅圈標記。側臉、遮住一半或很遠的臉可能偵測不到。</li>
+      <li>畫面中的人臉會自動蓋上卡通笑臉；只拍到半張臉、一隻眼睛或頭髮時，也會用「人體區域」判斷並蓋上笑臉，人體附近的小點不會當成蚊子。人臉偵測還沒載入完成或載入失敗時，會整個畫面不顯示，只顯示蚊子的紅圈標記。側臉、遮住一半或很遠的臉可能偵測不到。</li>
     </ul>
   </details>
   <footer><span id="ver"></span></footer>
@@ -155,7 +155,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
 <button class="update" id="updateBtn" hidden>有新版本，點此重新整理</button>
 
 <script>
-const VERSION = "v1.5.0";
+const VERSION = "v1.6.0";
 document.getElementById("ver").textContent = "蚊子雷達 " + VERSION;
 
 // ---- new-version check: compares VERSION with version.json on the server ----
@@ -313,7 +313,10 @@ $("startBtn").onclick = async () => {
 $("flipBtn").onclick = async () => { facing = facing === "environment" ? "user" : "environment"; if (running) await startCamera(); };
 
 // ---- face privacy ----
-let faceDet = null, faceState = "loading", faces = [], lastFaceT = 0, lastFaceSeen = 0;
+let faceDet = null, segmenter = null, faceState = "loading", faces = [], lastFaceT = 0, lastFaceSeen = 0;
+// person area (hair, partial face, one eye, body) from the selfie segmentation model, on a coarse grid
+const GW = 48, GH = 36;
+let personGrid = new Uint8Array(GW*GH), personZone = new Uint8Array(GW*GH), personBoxes = [], lastPersonSeen = 0;
 (async () => {
   try{
     let mp;
@@ -322,8 +325,14 @@ let faceDet = null, faceState = "loading", faces = [], lastFaceT = 0, lastFaceSe
     const files = await mp.FilesetResolver.forVisionTasks(new URL("./lib/wasm", location.href).href);
     faceDet = await mp.FaceDetector.createFromOptions(files, {
       baseOptions:{ modelAssetPath: new URL("./lib/face.tflite", location.href).href },
-      runningMode:"VIDEO", minDetectionConfidence:0.4
+      runningMode:"VIDEO", minDetectionConfidence:0.5
     });
+    try{
+      segmenter = await mp.ImageSegmenter.createFromOptions(files, {
+        baseOptions:{ modelAssetPath: new URL("./lib/selfie.tflite", location.href).href },
+        runningMode:"VIDEO", outputConfidenceMasks:true, outputCategoryMask:false
+      });
+    }catch(e){ console.warn("person segmenter failed", e); }
     faceState = "ready";
   }catch(e){ console.warn("face detector failed", e); faceState = "failed"; }
   updatePrivacy();
@@ -342,6 +351,65 @@ function detectFaces(t){
       faces = r.detections.map(d => d.boundingBox); lastFaceSeen = now;
     } else if (now - lastFaceSeen > 700) faces = [];  // keep last boxes briefly to avoid flicker gaps
   }catch(e){ console.warn("face detect error", e); }
+  if (segmenter){
+    try{
+      segmenter.segmentForVideo(video, t + 0.5, res => {
+        const m = res.confidenceMasks && res.confidenceMasks[0];
+        if (m) buildPerson(m.getAsFloat32Array(), m.width, m.height);
+      });
+    }catch(e){ console.warn("segment error", e); }
+  }
+}
+function buildPerson(conf, mw, mh){
+  const g = new Uint8Array(GW*GH);
+  let any = false;
+  for (let gy = 0; gy < GH; gy++) for (let gx = 0; gx < GW; gx++){
+    // sample 3x3 points inside the cell
+    let hit = 0;
+    for (let sy = 0; sy < 3; sy++) for (let sx = 0; sx < 3; sx++){
+      const x = Math.min(mw-1, ((gx + (sx+0.5)/3) / GW * mw) | 0), y = Math.min(mh-1, ((gy + (sy+0.5)/3) / GH * mh) | 0);
+      if (conf[y*mw + x] > 0.5) hit++;
+    }
+    if (hit >= 2){ g[gy*GW + gx] = 1; any = true; }
+  }
+  const now = performance.now();
+  if (!any && now - lastPersonSeen < 1000) return;   // keep the last person area for a moment
+  if (any) lastPersonSeen = now;
+  personGrid = g;
+  // exclusion zone for mosquito detection: person area grown by 2 cells
+  const z = new Uint8Array(GW*GH);
+  for (let gy = 0; gy < GH; gy++) for (let gx = 0; gx < GW; gx++) if (g[gy*GW+gx])
+    for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++){
+      const x = gx+dx, y = gy+dy; if (x >= 0 && y >= 0 && x < GW && y < GH) z[y*GW+x] = 1;
+    }
+  personZone = z;
+  // connected person regions -> boxes (normalized 0..1)
+  const seen = new Uint8Array(GW*GH), boxes = [];
+  for (let i = 0; i < GW*GH; i++){
+    if (!g[i] || seen[i]) continue;
+    const st = [i]; seen[i] = 1; let x0 = GW, y0 = GH, x1 = 0, y1 = 0, n = 0;
+    while (st.length){
+      const k = st.pop(), kx = k % GW, ky = (k / GW) | 0; n++;
+      if (kx<x0)x0=kx; if (kx>x1)x1=kx; if (ky<y0)y0=ky; if (ky>y1)y1=ky;
+      for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+        const x = kx+dx, y = ky+dy; if (x<0||y<0||x>=GW||y>=GH) continue;
+        const q = y*GW+x; if (g[q] && !seen[q]){ seen[q] = 1; st.push(q); }
+      }
+    }
+    if (n >= 2) boxes.push({ x0: x0/GW, y0: y0/GH, x1: (x1+1)/GW, y1: (y1+1)/GH });
+  }
+  personBoxes = boxes;
+}
+// is a point (processing coords) inside the person area or near a face?
+function nearPerson(x, y){
+  const gx = Math.min(GW-1, (x / W * GW) | 0), gy = Math.min(GH-1, (y / H * GH) | 0);
+  if (personZone[gy*GW + gx]) return true;
+  const sx = W / video.videoWidth, sy = H / video.videoHeight;
+  for (const b of faces){
+    const bx = b.originX*sx, by = b.originY*sy, bw = b.width*sx, bh = b.height*sy;
+    if (x > bx - bw*0.8 && x < bx + bw*1.8 && y > by - bh*1.0 && y < by + bh*3) return true;   // head, hair, shoulders
+  }
+  return false;
 }
 function smiley(cx, cy, r, t){
   const c = vctx;
@@ -385,6 +453,20 @@ function render(t){
     // cover the whole head generously (hair, ears, chin)
     const cx = b.originX + b.width/2, cy = b.originY + b.height*0.45;
     smiley(cx, cy, Math.max(b.width, b.height) * 0.95, t);
+  }
+  // person seen but no full face found (one eye, side face, top of head): cover the head part anyway
+  for (const p of personBoxes){
+    const x0 = p.x0*vw, y0 = p.y0*vh, x1 = p.x1*vw, y1 = p.y1*vh, bw = x1-x0, bh = y1-y0;
+    const covered = faces.some(f => f.originX < x1 && f.originX + f.width > x0 && f.originY < y1 && f.originY + f.height > y0);
+    if (covered) continue;
+    if (bh < bw * 1.3){
+      // only a head (or part of it) is visible: cover the whole region
+      smiley((x0+x1)/2, (y0+y1)/2, Math.max(bw, bh) * 0.62, t);
+    } else {
+      // tall region (head + body): cover the top part where the head is
+      const r = bw * 0.55;
+      smiley((x0+x1)/2, y0 + r*0.9, r, t);
+    }
   }
 }
 
@@ -430,7 +512,7 @@ function loop(t){
   const now = performance.now();
   const moving = now < movingUntil;
   // big change without the picture shifting (person walking by, light, auto exposure): skip this frame only
-  const bigChange = frac > 0.02;
+  const bigChange = frac > 0.15;   // e.g. lights switched on/off; people are handled by exclusion zones
   // update background: fast while warming or moving, slow otherwise
   const a = warm < 15 ? 0.3 : (moving || bigChange) ? 0.35 : 0.06;
   for (let i = 0; i < n; i++) bg[i] += (gray[i] - bg[i]) * a;
@@ -476,8 +558,10 @@ function globalShift(){
   return shiftRun >= 2;                                  // needs 2 frames in a row
 }
 
+let bigZones = [];   // areas around large moving things (people, hands, pets), kept for a moment
 function findBlobs(){
-  const maxA = S.maxSize, blobs = [];
+  const maxA = S.maxSize, blobs = [], now = performance.now();
+  bigZones = bigZones.filter(z => now - z.t < 1200);
   label.fill(0);
   const stack = [];
   let lid = 0;
@@ -499,11 +583,32 @@ function findBlobs(){
         }
       }
       const span = Math.max(maxx-minx, maxy-miny) + 1;
-      if (!big && area >= 2 && area <= maxA && span <= Math.sqrt(maxA)*3)
-        blobs.push({ x: sx/area, y: sy/area, area, r: span/2 + 2 });
+      if (big || area > maxA || span > Math.sqrt(maxA)*3){
+        const mx = (maxx-minx) * 0.4 + W*0.04, my = (maxy-miny) * 0.4 + W*0.04;
+        bigZones.push({ x0: minx-mx, y0: miny-my, x1: maxx+mx, y1: maxy+my, t: now });
+      } else if (area >= 2) blobs.push({ x: sx/area, y: sy/area, area, r: span/2 + 2, lab: lid });
     }
   }
-  return blobs.length > 12 ? null : blobs; // too many specks at once = camera moving or light flicker
+  const keep = blobs.filter(b => {
+    if (bigZones.some(z => b.x > z.x0 && b.x < z.x1 && b.y > z.y0 && b.y < z.y1)) return false;   // next to a person/large mover
+    if (nearPerson(b.x, b.y)) return false;                                                      // hair, partial face, body
+    // a mosquito is alone on a plain wall: reject if other changed pixels are close by (hair strands, edges)
+    // (one similar-sized neighbour is allowed: that is the mosquito's own fading trail)
+    const R = Math.max(6, W/50); let other = 0; const labs = new Set();
+    for (let y = Math.max(0, (b.y-R)|0); y <= Math.min(H-1, (b.y+R)|0); y++)
+      for (let x = Math.max(0, (b.x-R)|0); x <= Math.min(W-1, (b.x+R)|0); x++){
+        const i = y*W+x;
+        if (mask[i] && label[i] !== b.lab){ other++; labs.add(label[i]); }
+      }
+    if (labs.size >= 2 || other > b.area*2 + 4) return false;
+    // and the background around it should be fairly plain
+    let sum = 0, sq = 0, n = 0;
+    for (let y = Math.max(0, (b.y-R)|0); y <= Math.min(H-1, (b.y+R)|0); y += 2)
+      for (let x = Math.max(0, (b.x-R)|0); x <= Math.min(W-1, (b.x+R)|0); x += 2){ const v = bg[y*W+x]; sum += v; sq += v*v; n++; }
+    const sd = Math.sqrt(Math.max(0, sq/n - (sum/n)**2));
+    return sd < 28;
+  });
+  return keep.length > 12 ? null : keep;   // still many specks after removing people = flicker or noise
 }
 
 function updateTracks(blobs){
@@ -534,6 +639,10 @@ function draw(blobs){
     octx.putImageData(img, 0, 0);
     octx.strokeStyle = "rgba(240,180,76,.9)"; octx.lineWidth = 1;
     for (const b of blobs){ octx.beginPath(); octx.arc(b.x, b.y, b.r, 0, 7); octx.stroke(); }
+    octx.fillStyle = "rgba(120,160,255,.18)";
+    for (let gy = 0; gy < GH; gy++) for (let gx = 0; gx < GW; gx++) if (personZone[gy*GW+gx]) octx.fillRect(gx/GW*W, gy/GH*H, W/GW+0.5, H/GH+0.5);
+    octx.strokeStyle = "rgba(120,160,255,.8)";
+    for (const z of bigZones) octx.strokeRect(z.x0, z.y0, z.x1-z.x0, z.y1-z.y0);
   }
   const lw = Math.max(2, W/200), now = performance.now();
   // keep a dashed marker where the mosquito was last seen, for 6 seconds
@@ -564,7 +673,7 @@ function draw(blobs){
 }
 
 // expose for testing
-window.__mosq = { get count(){ return alarmCount; }, get tracks(){ return tracks; }, get face(){ return faceState; }, get frames(){ return fpsN; }, get faces(){ return faces; } };
+window.__mosq = { get count(){ return alarmCount; }, get tracks(){ return tracks; }, get face(){ return faceState; }, get frames(){ return fpsN; }, get faces(){ return faces; }, get person(){ return personBoxes.length; } };
 </script>
 </body>
 </html>
