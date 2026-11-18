@@ -20,6 +20,8 @@ html,body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--font
 header{display:flex;align-items:baseline;justify-content:space-between;gap:8px;flex-wrap:wrap}
 h1{margin:0;font-size:22px;letter-spacing:.02em}
 .ver{color:var(--muted);font:12px var(--mono)}
+footer{display:flex;justify-content:center;color:var(--muted);font:12px var(--mono)}
+.update{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));z-index:20;background:var(--warn);color:#1d1404;border:0;font-weight:700;box-shadow:0 4px 16px rgba(0,0,0,.4)}
 .stage{position:relative;width:100%;background:#000;border:3px solid var(--line);border-radius:10px;overflow:hidden;aspect-ratio:4/3;max-width:100%}
 .stage.alarm{border-color:var(--alarm);animation:flash .25s 4 alternate}
 @keyframes flash{to{border-color:transparent}}
@@ -57,7 +59,6 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
 <div class="wrap">
   <header>
     <h1>蚊子雷達</h1>
-    <span class="ver" id="ver"></span>
   </header>
 
   <div class="stage" id="stage">
@@ -134,11 +135,28 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
       <li>畫面中的人臉會自動蓋上卡通笑臉。人臉偵測還沒載入完成或載入失敗時，會整個畫面不顯示，只顯示蚊子的紅圈標記。側臉、遮住一半或很遠的臉可能偵測不到。</li>
     </ul>
   </details>
+  <footer><span id="ver"></span></footer>
 </div>
+<button class="update" id="updateBtn" hidden>有新版本，點此重新整理</button>
 
 <script>
-const VERSION = "v1.2.0";
-document.getElementById("ver").textContent = VERSION;
+const VERSION = "v1.3.0";
+document.getElementById("ver").textContent = "蚊子雷達 " + VERSION;
+
+// ---- new-version check: compares VERSION with version.json on the server ----
+let newVersion = null;
+async function checkUpdate(){
+  if (location.protocol === "file:") return;
+  try{
+    const r = await fetch("version.json?t=" + Date.now(), { cache: "no-store" });
+    const v = (await r.json()).version;
+    if (v && v !== VERSION){ newVersion = v; const b = document.getElementById("updateBtn"); b.textContent = "有新版本 " + v + "，點此重新整理"; b.hidden = false; }
+  }catch(e){}
+}
+document.getElementById("updateBtn").onclick = () => { location.href = location.pathname + "?v=" + encodeURIComponent(newVersion || Date.now()); };
+setInterval(checkUpdate, 5 * 60 * 1000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) checkUpdate(); });
+checkUpdate();
 
 const $ = id => document.getElementById(id);
 const video = $("video"), overlay = $("overlay"), octx = overlay.getContext("2d");

@@ -9,3 +9,7 @@
 使用方式：手機放穩，鏡頭對著白牆或淺色天花板（約 1 到 2 公尺內），開燈，按「開始偵測」。
 
 人臉偵測使用 [MediaPipe Tasks Vision](https://github.com/google-ai-edge/mediapipe)（Apache-2.0），檔案放在 `lib/`。
+
+## 改版
+
+改完程式後執行 `./bump.sh v1.4.0`（換成新版本號），再 commit、push。`index.html` 的版本號和 `version.json` 會一起更新；已經開著頁面的人，每 5 分鐘或切回分頁時會檢查，發現新版就跳出「有新版本，點此重新整理」按鈕。
