@@ -45,6 +45,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 .ctl label{display:flex;justify-content:space-between;gap:8px;font-size:14px}
 .ctl output{font:13px var(--mono);color:var(--accent)}
 .ctl small{color:var(--muted);font-size:12px}
+.ctl small.reading{font-family:var(--mono);color:var(--fg);font-variant-numeric:tabular-nums}
 input[type=range]{width:100%;accent-color:var(--accent)}
 select{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px}
 .check{flex-direction:row;flex-wrap:wrap;align-items:center;gap:10px}
@@ -109,6 +110,12 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
       <small>響過一次後，幾秒內不再重複響。</small>
     </div>
     <div class="ctl">
+      <label for="moveSens">鏡頭移動判斷 <output id="moveSensOut"></output></label>
+      <input type="range" id="moveSens" min="1" max="10" step="1" value="4">
+      <small>常誤報「鏡頭移動中」就調低。數值越低，要晃得越明顯才會暫停。</small>
+      <small id="moveRead" class="reading">感測器：尚未啟動</small>
+    </div>
+    <div class="ctl">
       <label for="res">分析解析度</label>
       <select id="res">
         <option value="320">低（省電）</option>
@@ -148,7 +155,7 @@ details ul{margin:8px 0 0;padding-left:20px;color:var(--muted)}
 <button class="update" id="updateBtn" hidden>有新版本，點此重新整理</button>
 
 <script>
-const VERSION = "v1.4.0";
+const VERSION = "v1.5.0";
 document.getElementById("ver").textContent = "蚊子雷達 " + VERSION;
 
 // ---- new-version check: compares VERSION with version.json on the server ----
@@ -180,10 +187,10 @@ const bind = (id, fmt) => {
   el.addEventListener("input", upd);
   return upd;
 };
-function save(){ try{ localStorage.setItem("mosq-settings", JSON.stringify({sens:$("sens").value,maxSize:$("maxSize").value,persist:$("persist").value,cooldown:$("cooldown").value,res:$("res").value,sound:$("sound").checked,vibrate:$("vibrate").checked})) }catch(e){} }
+function save(){ try{ localStorage.setItem("mosq-settings", JSON.stringify({sens:$("sens").value,maxSize:$("maxSize").value,persist:$("persist").value,cooldown:$("cooldown").value,moveSens:$("moveSens").value,res:$("res").value,sound:$("sound").checked,vibrate:$("vibrate").checked})) }catch(e){} }
 try{
   const saved = JSON.parse(localStorage.getItem("mosq-settings") || "null");
-  if (saved) for (const k of ["sens","maxSize","persist","cooldown","res"]) if (saved[k]) $(k).value = saved[k];
+  if (saved) for (const k of ["sens","maxSize","persist","cooldown","res","moveSens"]) if (saved[k]) $(k).value = saved[k];
   if (saved){ $("sound").checked = saved.sound !== false; $("vibrate").checked = saved.vibrate !== false; }
 }catch(e){}
 const updaters = [
@@ -191,6 +198,7 @@ const updaters = [
   bind("maxSize", v => v + " px"),
   bind("persist", v => v + " 幀"),
   bind("cooldown", v => v + " 秒"),
+  bind("moveSens", v => v + " / 10"),
 ];
 updaters.forEach(f => f());
 $("res").addEventListener("change", () => { save(); resetModel(); });
@@ -250,21 +258,29 @@ function buzz(){
 $("testBtn").onclick = () => { beep(); buzz(); const fa = $("flashAll"); fa.classList.remove("on"); void fa.offsetWidth; fa.classList.add("on"); };
 
 // ---- camera movement: motion sensor ----
-let movingUntil = 0;
+let movingUntil = 0, moveWhy = "", rotAvg = 0, accAvg = 0, hasSensor = false, shiftRun = 0, lastShift = [0,0];
 const SETTLE_MS = 1500;
-function markMoving(){ movingUntil = performance.now() + SETTLE_MS; }
+function markMoving(why){ movingUntil = performance.now() + SETTLE_MS; moveWhy = why; }
+// thresholds from the slider: 1 = only big movements, 10 = very touchy
+const rotThr = () => 4 + (10 - S.moveSens) * 4;        // degrees per second, slider 4 -> 28
+const accThr = () => 0.4 + (10 - S.moveSens) * 0.25;   // m/s^2, slider 4 -> 1.9
 function onMotion(e){
   const r = e.rotationRate, a = e.acceleration;
-  const rot = r ? Math.hypot(r.alpha || 0, r.beta || 0, r.gamma || 0) : 0;   // degrees per second
-  const acc = a ? Math.hypot(a.x || 0, a.y || 0, a.z || 0) : 0;              // m/s^2 without gravity
-  if (rot > 4 || acc > 0.35) markMoving();
+  if (!r && !a) return;
+  hasSensor = true;
+  const rot = r ? Math.hypot(r.alpha || 0, r.beta || 0, r.gamma || 0) : 0;
+  const acc = a ? Math.hypot(a.x || 0, a.y || 0, a.z || 0) : 0;
+  // smooth out sensor noise; a single spiky sample no longer counts
+  rotAvg += (rot - rotAvg) * 0.3; accAvg += (acc - accAvg) * 0.3;
+  if (rotAvg > rotThr() || accAvg > accThr()) markMoving("感測器");
 }
-async function enableMotion(){
+let motionOn = false;
+function enableMotion(){
+  if (!motionOn){ window.addEventListener("devicemotion", onMotion); motionOn = true; }
+  // iPhone needs permission (asked once, from the button tap); if refused, only the picture check is used
   try{
-    if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function"){
-      if (await DeviceMotionEvent.requestPermission() !== "granted") return;   // iPhone asks once
-    }
-    window.addEventListener("devicemotion", onMotion);
+    if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function")
+      DeviceMotionEvent.requestPermission().catch(() => {});
   }catch(e){}
 }
 
@@ -410,18 +426,23 @@ function loop(t){
     mask[i] = m; changed += m;
   }
   const frac = changed / n;
-  if (globalShift()) markMoving();
-  if (frac > 0.02) markMoving();                       // big part of the picture changed
+  if (globalShift()) markMoving("畫面整體位移");
   const now = performance.now();
   const moving = now < movingUntil;
+  // big change without the picture shifting (person walking by, light, auto exposure): skip this frame only
+  const bigChange = frac > 0.02;
   // update background: fast while warming or moving, slow otherwise
-  const a = warm < 15 ? 0.3 : moving ? 0.35 : 0.06;
+  const a = warm < 15 ? 0.3 : (moving || bigChange) ? 0.35 : 0.06;
   for (let i = 0; i < n; i++) bg[i] += (gray[i] - bg[i]) * a;
 
-  let blobs = (moving || warm < 15) ? [] : findBlobs();
-  if (blobs === null){ markMoving(); blobs = []; }      // lots of specks at once = picture shifting
+  let blobs = (moving || bigChange || warm < 15) ? [] : findBlobs();
+  if (blobs === null) blobs = [];                      // lots of specks at once = noise or flicker: ignore frame
+  if (fpsN % 6 === 0) $("moveRead").textContent =
+    (hasSensor ? "旋轉 " + rotAvg.toFixed(1) + "/" + rotThr() + " °/s　加速 " + accAvg.toFixed(2) + "/" + accThr().toFixed(1) : "沒有動作感測器") +
+    "　畫面位移 " + lastShift.join(",") + (moving ? "　→ 暫停（" + moveWhy + "）" : "");
   $("moving").hidden = !(moving && warm >= 15);
-  if (moving){ tracks = []; if (now - lastAlarm > 2000) setStatus("shake","鏡頭移動中已停止偵測，請把手機靜置"); }
+  if (moving){ tracks = []; if (now - lastAlarm > 2000) setStatus("shake","鏡頭移動中已停止偵測，請把手機靜置（" + moveWhy + "）"); }
+  else if (bigChange && warm >= 15){ tracks = []; if (now - lastAlarm > 2000) setStatus("shake","畫面大範圍變化（有人走動或光線變化），暫時略過"); }
   else if (warm >= 15 && now - lastAlarm > 2500) setStatus("watch","監視中");
 
   updateTracks(blobs);
@@ -448,7 +469,11 @@ function globalShift(){
   prevCoarse.set(coarse);
   const area = (CW - 2*m) * (CH - 2*m);
   // shifted match clearly better than "no movement", and the frame actually changed
-  return (bx || by) && best < zero * 0.75 && zero / area > 1.2;
+  lastShift = [bx, by];
+  const ratio = 0.45 + S.moveSens * 0.03;               // slider 4 -> best must be < 57% of no-shift error
+  const shifted = (bx || by) && best < zero * ratio && zero / area > 2;
+  shiftRun = shifted ? shiftRun + 1 : 0;
+  return shiftRun >= 2;                                  // needs 2 frames in a row
 }
 
 function findBlobs(){
